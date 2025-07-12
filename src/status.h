@@ -2,12 +2,12 @@
 
 #include <limits.h>
 
-enum Status : int {
-    status_ok,
-    status_error = INT_MIN,
-    status_cmdline_error,
-    status_socket_error,
-    status_thrd_error,
+enum Status {
+    STATUS_OK,
+    STATUS_ERR = INT_MIN,
+    STATUS_CMDLINE_ERR,
+    STATUS_SOCKET_ERR,
+    STATUS_THRD_ERR
 };
 
 typedef int Status;

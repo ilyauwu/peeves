@@ -14,10 +14,10 @@ add_executable(peeves
 
 target_link_libraries(peeves
     PRIVATE
-        liblfds600
+        mpscq
 )
 
 target_compile_features(peeves
     PRIVATE
-        c_std_23
+        c_std_11
 )

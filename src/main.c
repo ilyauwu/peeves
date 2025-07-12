@@ -1,17 +1,19 @@
 #include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/fcntl.h>
 #include <sys/socket.h>
-#include <unistd.h>
+#include <sys/unistd.h>
 
-#include <liblfds600.h>
+#include <mpscq.h>
 
 #include "cmdline.h"
 #include "status.h"
@@ -19,14 +21,15 @@
 #define MAX(A, B) ((A) > (B) ? (A) : (B))
 #define MIN(A, B) ((A) < (B) ? (A) : (B))
 
-#define SLEEP_TIME_USEC (250'000l)
+#define DELAY_USEC (1000u)
+#define RECONN_DELAY_USEC (10000u)
 
 #define PACKET_HEADER_SIZE (4lu)
 
 #define PACKET_DATA_SIZE_MIN (16lu)
 #define PACKET_DATA_SIZE_MAX (128lu)
 
-#define PACKET_QUEUE_SIZE (128lu)
+#define PACKET_QUEUE_CAP (1024lu)
 
 typedef char PacketHeader[PACKET_HEADER_SIZE];
 typedef char PacketData[PACKET_DATA_SIZE_MAX];
@@ -39,8 +42,6 @@ typedef struct Packet {
     PacketData data;
 } Packet;
 
-static_assert(sizeof(Packet) == sizeof(PacketData) + sizeof(PacketHeader));
-
 typedef struct Socket {
     int fd;
     struct sockaddr_in addr;
@@ -50,7 +51,7 @@ typedef struct Context {
     Socket in;
     Socket out;
     PacketHeader header;
-    struct lfds600_queue_state* queue;
+    struct mpscq* queue;
 } Context;
 
 static volatile sig_atomic_t is_running = 1;
@@ -67,7 +68,7 @@ static void shutdown_handler(int sig) {
 }
 
 static Status sigaction_set() {
-    struct sigaction action = {};
+    struct sigaction action = {0};
 
     action.sa_handler = shutdown_handler;
     action.sa_flags = SA_RESETHAND;
@@ -76,28 +77,28 @@ static Status sigaction_set() {
     const int sigs[] = {SIGINT, SIGTERM, SIGPIPE};
     for (size_t i = 0; i < sizeof(sigs) / sizeof(int); i++) {
         const int sig = sigs[i];
-        const int err = sigaction(sigs[i], &action, nullptr);
+        const int err = sigaction(sigs[i], &action, NULL);
         if (err) {
             fprintf(stderr, "error: sigaction: %s\n", strerror(errno));
-            return status_error;
+            return STATUS_ERR;
         }
     }
 
     action.sa_handler = SIG_IGN;
     action.sa_flags = 0x0;
 
-    const int err = sigaction(SIGPIPE, &action, nullptr);
+    const int err = sigaction(SIGPIPE, &action, NULL);
     if (err) {
         fprintf(stderr, "error: sigaction: %s\n", strerror(errno));
-        return status_error;
+        return STATUS_ERR;
     }
 
-    return status_ok;
+    return STATUS_OK;
 }
 
 static Status socket_create(Socket* s, const int type, const char* addr, const short port) {
     if (!s) {
-        return status_error;
+        return STATUS_ERR;
     }
 
     s->fd = socket(AF_INET, type, 0);
@@ -105,13 +106,14 @@ static Status socket_create(Socket* s, const int type, const char* addr, const s
     int err = s->fd == -1;
     if (err) {
         fprintf(stderr, "error: socket: %s\n", strerror(errno));
-        return status_socket_error;
+        return STATUS_SOCKET_ERR;
     }
 
     err = fcntl(s->fd, F_SETFL, fcntl(s->fd, F_GETFL) | O_NONBLOCK);
     if (err) {
         fprintf(stderr, "error: fcntl: %s\n", strerror(errno));
-        return status_socket_error;
+        close(s->fd);
+        return STATUS_SOCKET_ERR;
     }
 
     if (s->addr.sin_family == AF_UNSPEC) {
@@ -121,26 +123,35 @@ static Status socket_create(Socket* s, const int type, const char* addr, const s
         err = inet_pton(AF_INET, addr, &s->addr.sin_addr.s_addr) <= 0;
         if (err) {
             fprintf(stderr, "error: inet_pton\n");
-            return status_socket_error;
+            close(s->fd);
+            return STATUS_SOCKET_ERR;
         }
     }
 
     if (type == SOCK_STREAM) {
-        return status_ok;
+        err = setsockopt(s->fd, IPPROTO_TCP, TCP_NODELAY, &(int){1}, sizeof(int));
+        if (err) {
+            fprintf(stderr, "error: setsockopt: %s\n", strerror(errno));
+            close(s->fd);
+            return STATUS_SOCKET_ERR;
+        }
+
+        return STATUS_OK;
     }
 
     err = bind(s->fd, (struct sockaddr*)&s->addr, sizeof(struct sockaddr_in));
     if (err) {
         fprintf(stderr, "error: bind: %s\n", strerror(errno));
-        return status_socket_error;
+        close(s->fd);
+        return STATUS_SOCKET_ERR;
     }
 
-    return status_ok;
+    return STATUS_OK;
 }
 
 static Status socket_destroy(Socket* s) {
     if (!s) {
-        return status_error;
+        return STATUS_ERR;
     }
 
     const int fd = s->fd;
@@ -150,65 +161,70 @@ static Status socket_destroy(Socket* s) {
     const int err = close(fd);
     if (err) {
         fprintf(stderr, "error: close: %s\n", strerror(errno));
-        return status_socket_error;
+        return STATUS_SOCKET_ERR;
     }
 
-    return status_ok;
+    return STATUS_OK;
 }
 
-static Status send_packets(void*) {
+static Status send_packets(void* arg) {
+    (void)arg;
+
     Context* context = get_context();
     Socket* s = &context->out;
 
     bool is_connected = false;
 
-    Packet* packet = nullptr;
+    Packet* packet = NULL;
 
     while(is_running) {
         if (!is_connected) {
             if (s->fd == -1) {
-                socket_create(s, SOCK_STREAM, nullptr, 0);
+                socket_create(s, SOCK_STREAM, NULL, 0);
             }
 
             is_connected = connect(s->fd, (struct sockaddr*)&s->addr, sizeof(struct sockaddr_in)) == 0;
             if (!is_connected) {
-                // fprintf(stderr, "error: connect: %s\n", strerror(errno));
-                usleep(SLEEP_TIME_USEC);
+                usleep(RECONN_DELAY_USEC);
                 continue;
             }
         }
 
         if (!packet) {
-            lfds600_queue_dequeue(context->queue, (void**)&packet);
-        }
-
-        if (packet) {
-            const size_t size = packet->size + sizeof(PacketHeader);
-            memcpy(packet->header, context->header, sizeof(PacketHeader));
-
-            const int sent = send(s->fd, packet, size, 0);
-            if (sent == -1) {
-                if (errno == ECONNRESET || errno == EPIPE) {
-                    is_connected = false;
-                    socket_destroy(s);
-                }
-                fprintf(stderr, "error: send: %s\n", strerror(errno));
-            } else {
-                free(packet);
-                packet = nullptr;
+            const bool is_dequeued = (packet = mpscq_dequeue(context->queue));
+            if (!is_dequeued) {
+                usleep(DELAY_USEC);
+                continue;
             }
         }
 
-        usleep(SLEEP_TIME_USEC);
+        const size_t size = packet->size + sizeof(PacketHeader);
+        memcpy(packet->header, context->header, sizeof(PacketHeader));
+
+        const int sent = send(s->fd, packet, size, 0);
+        if (sent == -1) {
+            if (errno == ECONNRESET || errno == EPIPE) {
+                is_connected = false;
+                socket_destroy(s);
+            }
+            fprintf(stderr, "error: send: %s\n", strerror(errno));
+        } else {
+            free(packet);
+            packet = NULL;
+        }
     }
 
-    return status_ok;
+    if (packet) {
+        free(packet);
+    }
+
+    return STATUS_OK;
 }
 
 static Status recv_packets() {
     const Context* context = get_context();
 
-    Packet* packet = nullptr;
+    Packet* packet = NULL;
 
     while(is_running) {
         if (!packet) {
@@ -217,54 +233,53 @@ static Status recv_packets() {
 
         packet->size = recv(context->in.fd, packet->data, PACKET_DATA_SIZE_MAX, 0);
         if (packet->size == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // TODO: maybe poll
-            } else {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 fprintf(stderr, "error: recv: %s\n", strerror(errno));
             }
         } else if (packet->size >= PACKET_DATA_SIZE_MIN) {
-            if (lfds600_queue_enqueue(context->queue, packet)) {
-                packet = nullptr;
-            } else {
-                memset(packet, 0x0, sizeof(Packet));
+            const bool is_enqueued = mpscq_enqueue(context->queue, packet);
+            if (is_enqueued) {
+                packet = NULL;
+                continue;
             }
+            memset(packet, 0x0, packet->size);
         }
 
-        usleep(SLEEP_TIME_USEC);
+        usleep(DELAY_USEC);
     }
 
     if (packet) {
         free(packet);
     }
 
-    return status_ok;
+    return STATUS_OK;
 }
 
 int main(int argc, char** argv) {
     Status status = sigaction_set();
-    if (status != status_ok) {
+    if (status != STATUS_OK) {
         return status;
     }
 
-    struct gengetopt_args_info args_info = {};
+    struct gengetopt_args_info args_info = {0};
     cmdline_parser_init(&args_info);
 
     int err = cmdline_parser(argc, argv, &args_info);
     if (err) {
-        return status_cmdline_error;
+        return STATUS_CMDLINE_ERR;
     }
 
     Context* context = get_context();
 
     status = socket_create(&context->in, SOCK_DGRAM, args_info.in_addr_arg, args_info.in_port_arg);
-    if (status != status_ok) {
+    if (status != STATUS_OK) {
         cmdline_parser_free(&args_info);
 
         return status;
     }
 
     status = socket_create(&context->out, SOCK_STREAM, args_info.out_addr_arg, args_info.out_port_arg);
-    if (status != status_ok) {
+    if (status != STATUS_OK) {
         socket_destroy(&context->in);
 
         cmdline_parser_free(&args_info);
@@ -276,35 +291,36 @@ int main(int argc, char** argv) {
 
     cmdline_parser_free(&args_info);
 
-    if (!lfds600_queue_new(&context->queue, PACKET_QUEUE_SIZE)) {
-        fprintf(stderr, "error: lfds600_queue_new\n");
+    context->queue = mpscq_create(NULL, PACKET_QUEUE_CAP);
+    if (!context->queue) {
+        fprintf(stderr, "error: mpscq_create\n");
 
         socket_destroy(&context->out);
         socket_destroy(&context->in);
 
-        return status_error;
+        return STATUS_ERR;
     }
 
-    thrd_t sender = {};
-    if (thrd_create(&sender, send_packets, nullptr) != thrd_success) {
+    thrd_t sender = {0};
+    if (thrd_create(&sender, send_packets, NULL) != thrd_success) {
         fprintf(stderr, "error: thrd_create\n");
 
-        lfds600_queue_delete(context->queue, nullptr, nullptr);
+        mpscq_destroy(context->queue);
 
         socket_destroy(&context->out);
         socket_destroy(&context->in);
 
-        return status_thrd_error;
+        return STATUS_THRD_ERR;
     }
 
     recv_packets();
 
-    if (thrd_join(sender, nullptr) != thrd_success) {
+    if (thrd_join(sender, NULL) != thrd_success) {
         fprintf(stderr, "error: thrd_join\n");
-        status = status_thrd_error;
+        status = STATUS_THRD_ERR;
     }
 
-    lfds600_queue_delete(context->queue, nullptr, nullptr);
+    mpscq_destroy(context->queue);
 
     socket_destroy(&context->out);
     socket_destroy(&context->in);

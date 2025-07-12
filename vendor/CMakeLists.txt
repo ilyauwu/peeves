@@ -1,1 +1,1 @@
-add_subdirectory(liblfds600)
+add_subdirectory(mpscq)
