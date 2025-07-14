@@ -16,10 +16,8 @@
 #include <mpscq.h>
 
 #include "cmdline.h"
-#include "status.h"
-
-#define MAX(A, B) ((A) > (B) ? (A) : (B))
-#define MIN(A, B) ((A) < (B) ? (A) : (B))
+#include "foundation.h"
+#include "logger.h"
 
 #define DELAY_USEC (1000u)
 #define RECONN_DELAY_USEC (10000u)
@@ -209,6 +207,7 @@ static Status send_packets(void* arg) {
             }
             fprintf(stderr, "error: send: %s\n", strerror(errno));
         } else {
+            LOG("[INFO] send packet: %s", packet->header);
             free(packet);
             packet = NULL;
         }
@@ -239,6 +238,7 @@ static Status recv_packets() {
         } else if (packet->size >= PACKET_DATA_SIZE_MIN) {
             const bool is_enqueued = mpscq_enqueue(context->queue, packet);
             if (is_enqueued) {
+                LOG("[INFO] recv packet: %s", packet->data);
                 packet = NULL;
                 continue;
             }
@@ -255,6 +255,27 @@ static Status recv_packets() {
     return STATUS_OK;
 }
 
+static void shutdown_gracefully() {
+    Context* contex = get_context();
+
+    if (contex->queue) {
+        mpscq_destroy(contex->queue);
+        contex->queue = NULL;
+    }
+
+    if (contex->out.fd != -1) {
+        socket_destroy(&contex->out);
+    }
+
+    if (contex->in.fd != -1) {
+        socket_destroy(&contex->in);
+    }
+
+#ifdef LOG_ENABLED
+    logger_shutdown();
+#endif
+}
+
 int main(int argc, char** argv) {
     Status status = sigaction_set();
     if (status != STATUS_OK) {
@@ -266,6 +287,7 @@ int main(int argc, char** argv) {
 
     int err = cmdline_parser(argc, argv, &args_info);
     if (err) {
+        cmdline_parser_free(&args_info);
         return STATUS_CMDLINE_ERR;
     }
 
@@ -274,56 +296,52 @@ int main(int argc, char** argv) {
     status = socket_create(&context->in, SOCK_DGRAM, args_info.in_addr_arg, args_info.in_port_arg);
     if (status != STATUS_OK) {
         cmdline_parser_free(&args_info);
-
-        return status;
+        goto gracefull_shutdown;
     }
 
     status = socket_create(&context->out, SOCK_STREAM, args_info.out_addr_arg, args_info.out_port_arg);
     if (status != STATUS_OK) {
-        socket_destroy(&context->in);
-
         cmdline_parser_free(&args_info);
-
-        return status;
+        goto gracefull_shutdown;
     }
 
     memcpy(context->header, args_info.header_arg, MIN(sizeof(PacketHeader), strlen(args_info.header_arg)));
+
+#ifdef LOG_ENABLED
+    if (args_info.log_given) {
+        status = logger_init(args_info.log_arg);
+        if (status != STATUS_OK) {
+            cmdline_parser_free(&args_info);
+            goto gracefull_shutdown;
+        }
+    }
+#endif
 
     cmdline_parser_free(&args_info);
 
     context->queue = mpscq_create(NULL, PACKET_QUEUE_CAP);
     if (!context->queue) {
         fprintf(stderr, "error: mpscq_create\n");
-
-        socket_destroy(&context->out);
-        socket_destroy(&context->in);
-
-        return STATUS_ERR;
+        status = STATUS_ERR;
+        goto gracefull_shutdown;
     }
 
     thrd_t sender = {0};
     if (thrd_create(&sender, send_packets, NULL) != thrd_success) {
         fprintf(stderr, "error: thrd_create\n");
-
-        mpscq_destroy(context->queue);
-
-        socket_destroy(&context->out);
-        socket_destroy(&context->in);
-
-        return STATUS_THRD_ERR;
+        status = STATUS_THRD_ERR;
+        goto gracefull_shutdown;
     }
 
     recv_packets();
 
     if (thrd_join(sender, NULL) != thrd_success) {
-        fprintf(stderr, "error: thrd_join\n");
+        fprintf(stderr, "error: thrd_join: %lu\n", sender);
         status = STATUS_THRD_ERR;
     }
 
-    mpscq_destroy(context->queue);
-
-    socket_destroy(&context->out);
-    socket_destroy(&context->in);
+gracefull_shutdown:
+    shutdown_gracefully();
 
     return status;
 }

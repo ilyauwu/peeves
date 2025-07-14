@@ -6,5 +6,4 @@ option "in-addr"  - "Input address" string required
 option "in-port"  - "Input port number" int required
 option "out-addr" - "Output address" string required
 option "out-port" - "Output port number" int required
-
-# option "log" l "Path to log file" string required
+option "log"      l "Path to log file" string optional

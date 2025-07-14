@@ -41,6 +41,7 @@ const char *gengetopt_args_info_help[] = {
   "      --in-port=INT      Input port number",
   "      --out-addr=STRING  Output address",
   "      --out-port=INT     Output port number",
+  "  -l, --log=STRING       Path to log file",
     0
 };
 
@@ -74,6 +75,7 @@ void clear_given (struct gengetopt_args_info *args_info)
   args_info->in_port_given = 0 ;
   args_info->out_addr_given = 0 ;
   args_info->out_port_given = 0 ;
+  args_info->log_given = 0 ;
 }
 
 static
@@ -88,6 +90,8 @@ void clear_args (struct gengetopt_args_info *args_info)
   args_info->out_addr_arg = NULL;
   args_info->out_addr_orig = NULL;
   args_info->out_port_orig = NULL;
+  args_info->log_arg = NULL;
+  args_info->log_orig = NULL;
   
 }
 
@@ -103,6 +107,7 @@ void init_args_info(struct gengetopt_args_info *args_info)
   args_info->in_port_help = gengetopt_args_info_help[4] ;
   args_info->out_addr_help = gengetopt_args_info_help[5] ;
   args_info->out_port_help = gengetopt_args_info_help[6] ;
+  args_info->log_help = gengetopt_args_info_help[7] ;
   
 }
 
@@ -200,6 +205,8 @@ cmdline_parser_release (struct gengetopt_args_info *args_info)
   free_string_field (&(args_info->out_addr_arg));
   free_string_field (&(args_info->out_addr_orig));
   free_string_field (&(args_info->out_port_orig));
+  free_string_field (&(args_info->log_arg));
+  free_string_field (&(args_info->log_orig));
   
   
 
@@ -244,6 +251,8 @@ cmdline_parser_dump(FILE *outfile, struct gengetopt_args_info *args_info)
     write_into_file(outfile, "out-addr", args_info->out_addr_orig, 0);
   if (args_info->out_port_given)
     write_into_file(outfile, "out-port", args_info->out_port_orig, 0);
+  if (args_info->log_given)
+    write_into_file(outfile, "log", args_info->log_orig, 0);
   
 
   i = EXIT_SUCCESS;
@@ -559,10 +568,11 @@ cmdline_parser_internal (
         { "in-port",	1, NULL, 0 },
         { "out-addr",	1, NULL, 0 },
         { "out-port",	1, NULL, 0 },
+        { "log",	1, NULL, 'l' },
         { 0,  0, 0, 0 }
       };
 
-      c = getopt_long (argc, argv, "hV", long_options, &option_index);
+      c = getopt_long (argc, argv, "hVl:", long_options, &option_index);
 
       if (c == -1) break;	/* Exit from `while (1)' loop.  */
 
@@ -578,6 +588,18 @@ cmdline_parser_internal (
           cmdline_parser_free (&local_args_info);
           exit (EXIT_SUCCESS);
 
+        case 'l':	/* Path to log file.  */
+        
+        
+          if (update_arg( (void *)&(args_info->log_arg), 
+               &(args_info->log_orig), &(args_info->log_given),
+              &(local_args_info.log_given), optarg, 0, 0, ARG_STRING,
+              check_ambiguity, override, 0, 0,
+              "log", 'l',
+              additional_error))
+            goto failure;
+        
+          break;
 
         case 0:	/* Long option with no short option */
           /* Message header text.  */

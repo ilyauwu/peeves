@@ -54,6 +54,9 @@ struct gengetopt_args_info
   int out_port_arg;	/**< @brief Output port number.  */
   char * out_port_orig;	/**< @brief Output port number original value given at command line.  */
   const char *out_port_help; /**< @brief Output port number help description.  */
+  char * log_arg;	/**< @brief Path to log file.  */
+  char * log_orig;	/**< @brief Path to log file original value given at command line.  */
+  const char *log_help; /**< @brief Path to log file help description.  */
   
   unsigned int help_given ;	/**< @brief Whether help was given.  */
   unsigned int version_given ;	/**< @brief Whether version was given.  */
@@ -62,6 +65,7 @@ struct gengetopt_args_info
   unsigned int in_port_given ;	/**< @brief Whether in-port was given.  */
   unsigned int out_addr_given ;	/**< @brief Whether out-addr was given.  */
   unsigned int out_port_given ;	/**< @brief Whether out-port was given.  */
+  unsigned int log_given ;	/**< @brief Whether log was given.  */
 
 } ;
 
